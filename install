@@ -1,0 +1,179 @@
+#!/bin/bash
+
+# README
+# create debian server with only standard systemtools and SSH server selected
+# Connect sftp://ip via filebrowser or filezilla winscp etc copy install script to Server
+# Connect from terminal via ssh switch to root via "su -" !IMPORTANT
+# make script executable and execute script ./install
+
+bold=`echo -en "\e[1m"`
+underline=`echo -en "\e[4m"`
+normal=`echo -en "\e[0m"`
+red=`echo -en "\e[31m"`
+green=`echo -en "\e[32m"`
+lightaqua=`echo -en "\e[96m"`
+clear
+echo "${bold}${underline}${green}Debian 10 - Webserver Installation and Configuration Script$normal"
+## root check ##################################################################
+if [ "$EUID" -ne 0 ]
+  then echo "${red}Please run as root. Use following command: ${lightaqua}su -$normal"
+  exit
+fi
+
+## Info / prerequisites text ###################################################
+echo "${red}Prerequisites:$normal"
+echo "- A Debian 10 server with SSH"
+echo "- You need a domain name."
+echo "  You can get one for free on: https://www.freenom.com/"
+echo "- You need DNS records type A:"
+echo "  empty -> WAN IP"
+echo "  www -> WAN IP"
+echo "  sub1 -> WAN IP"
+echo "  or even better caa records for better security"
+echo "- Port forwarding HTTP and HTTPS on router to server IP"
+echo
+## Inputs ######################################################################
+read -p "${green}Enter your superuser for webstuff (not root): $normal" superuser
+read -s -p "${green}Enter superuser password: $normal" superuserpw
+echo
+read -s -p "${green}Enter root password: $normal" rootpw
+echo
+read -p "${green}Enter webroot directory (/var/www): $normal" webroot
+read -p "${green}Enter main domain (mystixweb.tk): $normal" maindomain
+read -p "${green}Enter directory name for main domain in webroot $webroot/ (client): $normal" mainwebdir
+read -p "${green}Please enter subdomains separated by space. Dont enter 'www'! (api sub2 sub3): $normal" subdomains
+
+## update and install stuff ####################################################
+apt -qq update -y && apt -qq upgrade -y && apt -qq full-upgrade -y && apt -qq autoremove -y
+
+## install and configure firewall ##############################################
+apt -qq -y install ufw
+ufw allow SSH
+ufw allow "WWW Full"
+ufw enable
+ufw status
+
+## install and enable apache2 php-fpm http2 ####################################
+apt -qq -y install apache2 libapache2-mod-fcgid php7.3 php7.3-fpm
+a2enmod actions fcgid alias proxy_fcgi http2
+
+## create directories and permissions###########################################
+usermod -a -G www-data $superuser
+
+mkdir $webroot/$mainwebdir
+chgrp -R www-data $webroot/$mainwebdir
+chmod -R 755 $webroot/$mainwebdir
+chmod -R g+s $webroot/$mainwebdir
+chown -R $superuser $webroot/$mainwebdir
+echo "<h1>Welcome to $maindomain</h1>" > $webroot/$mainwebdir/index.php
+echo "<?php phpinfo(); ?>" > $webroot/$mainwebdir/info.php
+
+for subdomain in $subdomains
+do
+  mkdir $webroot/$subdomain
+  chgrp -R www-data $webroot/$subdomain
+  chmod -R 755 $webroot/$subdomain
+  chmod -R g+s $webroot/$subdomain
+  chown -R $superuser $webroot/$subdomain
+  echo "<h1>Welcome to $subdomain.$maindomain</h1>" > $webroot/$subdomain/index.php
+done
+
+## Create Apache2 Configuration files ##########################################
+echo "<VirtualHost *:80>
+    Protocols h2 http/1.1
+    ServerName $maindomain
+    ServerAlias www.$maindomain
+    DocumentRoot $webroot/$mainwebdir
+    <Directory $webroot/$mainwebdir>
+        Options -Indexes +FollowSymLinks +MultiViews
+        AllowOverride All
+        Require all granted
+    </Directory>
+    <FilesMatch \.php$>
+        SetHandler \"proxy:unix:/var/run/php/php7.3-fpm.sock|fcgi://localhost\"
+    </FilesMatch>
+    ErrorLog ${APACHE_LOG_DIR}/error.log
+    CustomLog ${APACHE_LOG_DIR}/access.log combined
+</VirtualHost>" > /etc/apache2/sites-available/$maindomain.conf
+a2ensite $maindomain
+
+for subdomain in $subdomains
+do
+  echo "<VirtualHost *:80>
+    Protocols h2 http/1.1
+    ServerName $subdomain.$maindomain
+    DocumentRoot $webroot/$subdomain
+    <Directory $webroot/$subdomain>
+        Options -Indexes +FollowSymLinks +MultiViews
+        AllowOverride All
+        Require all granted
+    </Directory>
+    <FilesMatch \.php$>
+        SetHandler \"proxy:unix:/var/run/php/php7.3-fpm.sock|fcgi://localhost\"
+    </FilesMatch>
+    ErrorLog ${APACHE_LOG_DIR}/error.log
+    CustomLog ${APACHE_LOG_DIR}/access.log combined
+</VirtualHost>" > /etc/apache2/sites-available/$subdomain.$maindomain.conf
+a2ensite $subdomain.$maindomain
+done
+
+systemctl restart apache2
+
+apt -qq -y install python-certbot-apache #-t buster-backports
+
+domainsstring="-d $maindomain -d www.$maindomain"
+for subdomain in $subdomains
+do
+  domainsstring+=" -d $subdomain.$maindomain"
+done
+
+certbot --apache --agree-tos --redirect --uir --hsts --staple-ocsp --must-staple --rsa-key-size 4096 $domainsstring --email mystixrage@gmx.ch
+
+#only allow TLSv1.3
+sed -i -e 's/SSLProtocol.*/SSLProtocol             all -SSLv2 -SSLv3 -TLSv1 -TLSv1.1 -TLSv1.2/g' /etc/letsencrypt/options-ssl-apache.conf
+#only allow strong cypher suites
+sed -i -e 's/SSLCipherSuite.*/SSLCipherSuite TLSv1.3 TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256/g' /etc/letsencrypt/options-ssl-apache.conf
+#redirect www.domain.xyz to domain.xyz
+sed -i -e "s@RewriteRule ^ .*@RewriteRule ^ https://$maindomain%{REQUEST_URI} [END,NE,R=permanent]@g" /etc/apache2/sites-available/$maindomain.conf
+sed -i -e "s@</VirtualHost>.*@RewriteEngine on\nRewriteCond %{SERVER_NAME} =www.$maindomain\nRewriteRule ^ https://$maindomain%{REQUEST_URI} [END,NE,R=permanent]\n</VirtualHost>@g" /etc/apache2/sites-available/$maindomain-le-ssl.conf
+
+
+
+#Diffie hellman key exchange
+openssl dhparam -out /etc/ssl/certs/dhparams4096.pem 4096
+echo "SSLOpenSSLConfCmd DHParameters "/etc/ssl/certs/dhparams4096.pem"
+SSLOpenSSLConfCmd ECDHParameters secp384r1
+SSLOpenSSLConfCmd Curves secp521r1:secp384r1" >> /etc/letsencrypt/options-ssl-apache.conf
+
+systemctl restart apache2
+
+## install and configure mariadb and phpmyadmin ################################
+apt -qq -y install mariadb-server mariadb-client
+echo "${lightaqua}Choose:$normal"
+echo "Enter current password for root (enter for none): Just press the Enter
+  Set root password? [Y/n]: Y
+  New password: Enter password
+  Re-enter new password: Repeat password
+  Remove anonymous users? [Y/n]: Y
+  Disallow root login remotely? [Y/n]: Y
+  Remove test database and access to it? [Y/n]:  Y
+  Reload privilege tables now? [Y/n]:  Y"
+
+mysql_secure_installation
+## remove plugin and set permissions ###########################################
+mysql --database="mysql" --execute="UPDATE user SET plugin='' WHERE user ='root';FLUSH PRIVILEGES;"
+systemctl restart mariadb
+mysql --user="root" --password="$rootpw" --execute="GRANT ALL PRIVILEGES ON *.* TO '$superuser'@'localhost' IDENTIFIED BY '$superuserpw';"
+
+#TODO phpmyadmin installation
+#echo "deb http://ftp.debian.org/debian buster-backports main" >> /etc/apt/sources.list
+#apt install phpmyadmin
+
+
+## hardening apache2 ##############################TODO add more stuff##########
+echo "ServerSignature Off
+ServerTokens Prod" >> /etc/apache2/apache2.conf
+systemctl restart apache2
+
+
+echo "${green}Everything Done.$normal"
